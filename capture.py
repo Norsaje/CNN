@@ -1,5 +1,4 @@
 import cv2
 
-cap = cv2.VideoCapture()
+video = cv2.VideoCapture(0)
 
-pass
