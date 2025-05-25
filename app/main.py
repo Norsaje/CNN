@@ -12,7 +12,7 @@ from model_pytorch import ResNet50Classifier
 
 # Параметры очереди и задержек
 MAX_QUEUE_SIZE = 3
-CAPTURE_FPS = 30
+CAPTURE_FPS = 60
 
 
 class CaptureThread(Thread):

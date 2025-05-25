@@ -22,7 +22,6 @@ class ResNet50Classifier:
             num_classes=33,
         )
         ckpt = torch.load(weights_path, map_location=self.device)
-        self.model.load_state_dict(ckpt)
         self.model.to(self.device).eval()
 
     @torch.no_grad()
