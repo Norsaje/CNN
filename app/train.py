@@ -17,38 +17,41 @@ from decord import VideoReader, cpu
 from sklearn.metrics import accuracy_score
 
 # -----------------------------
-# 1) Dataset для bukva
+# 1) Dataset
 # -----------------------------
 class BukvaVideoDataset(Dataset):
     def __init__(self, root: Path, annotations_file: Path,
                  frames_per_clip: int = 8, transform=None):
-        """
-        root: папка bukva/data
-        annotations_file: bukva/annotations.tsv (формат: video_path \t label)
-        """
         self.root = root
         self.frames_per_clip = frames_per_clip
         self.transform = transform
 
-        # читаем аннотации
-        lines = annotations_file.read_text().strip().splitlines()
-        self.samples = []
-        for line in lines[1:]:  # пропустить header
+        lines = annotations_file.read_text(encoding='utf-8').strip().splitlines()
+        raw_samples = []
+        labels_set = set()
+
+        for line in lines[1:]:  # skip header
             vid_path, label = line.split('\t')[:2]
-            self.samples.append((root/vid_path, int(label)))  # метки числами
+            video_path = root / f"{vid_path}.mp4"
+            raw_samples.append((video_path, label))
+            labels_set.add(label)
+
+        self.label2idx = {label: idx for idx, label in enumerate(sorted(labels_set))}
+
+        self.samples = []
+        for video_path, label in raw_samples:
+            self.samples.append((video_path, self.label2idx[label]))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        video_path, label = self.samples[idx]
+        video_path, label_idx = self.samples[idx]
         vr = VideoReader(str(video_path), ctx=cpu(0))
         total_frames = len(vr)
-        # равномерно берём кадры
         indices = torch.linspace(0, total_frames - 1, self.frames_per_clip).long().tolist()
-        frames = vr.get_batch(indices).asnumpy()  # форма (T, H, W, 3)
+        frames = vr.get_batch(indices).asnumpy()  # (T, H, W, 3)
 
-        # превратить в тензор (T,3,H,W) и нормализовать
         clip = []
         for img in frames:
             img = transforms.ToPILImage()(img)
@@ -58,26 +61,31 @@ class BukvaVideoDataset(Dataset):
                 img = transforms.ToTensor()(img)
             clip.append(img)
         clip = torch.stack(clip)  # (T, C, H, W)
-        # для модели TSM ожидаем (C, T, H, W)
-        clip = clip.permute(1, 0, 2, 3)
-        return clip, label
+        clip = clip.permute(1, 0, 2, 3)  # (C, T, H, W)
+        return clip, label_idx
 
 # -----------------------------
-# 2) Модель: TSM с ResNet50
+# 2) Model builder
 # -----------------------------
 def build_model(num_classes: int, pretrained: bool = True):
-    # используем библиотеку timm с реализацией TSM
+    # Вариант 1: обычный ResNet50, используем усреднение по времени
     model = timm.create_model(
-        'resnet50_tsm',
+        'resnet50',
         pretrained=pretrained,
-        num_classes=num_classes,
-        num_segments=8,         # фреймов на клип
-        shift_div=8             # TSM hyperparam
+        num_classes=num_classes
     )
+
+    # Вариант 2: раскомментируй это, если хочешь настоящую видео-модель (TSM)
+    # model = timm.create_model(
+    #     'tsm_resnet50',
+    #     pretrained=pretrained,
+    #     num_classes=num_classes
+    # )
+
     return model
 
 # -----------------------------
-# 3) Цикл тренировки
+# 3) Training loop
 # -----------------------------
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
@@ -85,7 +93,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     for clips, labels in loader:
         clips = clips.to(device)
         labels = labels.to(device)
-        out = model(clips)           # (B, num_classes)
+
+        # Если модель не умеет в видео — усредняем по времени (C, T, H, W) → (C, H, W)
+        if clips.ndim == 5:  # (B, C, T, H, W)
+            clips = clips.mean(dim=2)
+
+        out = model(clips)
         loss = criterion(out, labels)
         optimizer.zero_grad()
         loss.backward()
@@ -95,7 +108,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         preds.extend(out.argmax(1).cpu().numpy())
         targets.extend(labels.cpu().numpy())
     acc = accuracy_score(targets, preds)
-    return sum(losses)/len(losses), acc
+    return sum(losses) / len(losses), acc
 
 def validate(model, loader, criterion, device):
     model.eval()
@@ -104,6 +117,10 @@ def validate(model, loader, criterion, device):
         for clips, labels in loader:
             clips = clips.to(device)
             labels = labels.to(device)
+
+            if clips.ndim == 5:  # (B, C, T, H, W)
+                clips = clips.mean(dim=2)
+
             out = model(clips)
             loss = criterion(out, labels)
 
@@ -111,10 +128,10 @@ def validate(model, loader, criterion, device):
             preds.extend(out.argmax(1).cpu().numpy())
             targets.extend(labels.cpu().numpy())
     acc = accuracy_score(targets, preds)
-    return sum(losses)/len(losses), acc
+    return sum(losses) / len(losses), acc
 
 # -----------------------------
-# 4) Main: аргументы и запуск
+# 4) Main
 # -----------------------------
 def main():
     p = ArgumentParser()
@@ -124,32 +141,28 @@ def main():
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--num-workers', type=int, default=4)
-    p.add_argument('--device', type=str, default='cuda')
+    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
 
-    # Аугментации и нормализация
     transform = transforms.Compose([
-        transforms.Resize((224,224)),
+        transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406],
-                             std=[0.229,0.224,0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
 
-    # Датасеты
     full = BukvaVideoDataset(args.bukva_root, args.ann_file, transform=transform)
-    # простая разбивка train/val 80/20
     val_size = int(0.2 * len(full))
-    train_set, val_set = torch.utils.data.random_split(full, [len(full)-val_size, val_size])
+    train_set, val_set = torch.utils.data.random_split(full, [len(full) - val_size, val_size])
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader   = DataLoader(val_set,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size,
+                            shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    # Модель
-    num_classes = max(s[1] for s in full.samples) + 1
+    num_classes = len(full.label2idx)
     model = build_model(num_classes).to(args.device)
 
     criterion = nn.CrossEntropyLoss()
@@ -157,19 +170,18 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_acc = 0.0
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, args.device)
-        val_loss, val_acc     = validate(model, val_loader,    criterion, args.device)
+        val_loss, val_acc = validate(model, val_loader, criterion, args.device)
         scheduler.step()
 
         print(f"[Epoch {epoch:02d}] "
               f"Train: loss={train_loss:.3f}, acc={train_acc:.3f} | "
               f"Val:   loss={val_loss:.3f}, acc={val_acc:.3f}")
 
-        # сохраняем лучший чекпоинт
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), 'best_tsm_resnet50.pth')
+            torch.save(model.state_dict(), 'best_resnet50.pth')
             print(f" → New best: {best_acc:.3f}, model saved.")
 
 if __name__ == '__main__':
