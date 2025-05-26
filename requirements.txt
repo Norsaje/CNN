@@ -1,0 +1,7 @@
+opencv-python
+mediapipe
+PySimpleGUI
+ffmpeg-python
+numpy
+scikit-learn
+joblib
