@@ -1,4 +1,3 @@
-onnx==1.14.0
 streamlit==1.28.2
 streamlit-webrtc==0.47.1
 einops==0.6.1
@@ -10,6 +9,15 @@ onnx
 onnxruntime
 einops
 joblib
+scikit-learn>=1.3.0
+customtkinter>=5.2.0
+torch>=2.0.0
+tkinter  
+json 
+collections 
+threading 
+os 
+sys 
 # only for mac
 onnxruntime==1.16.0; sys_platform == 'darwin'
 # only linux or windows
